@@ -12,6 +12,8 @@ import {Currency, CurrencyLibrary} from "./types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "./types/PoolOperation.sol";
 import {SafeCast} from "./libraries/SafeCast.sol";
 import {IERC20Minimal} from "./interfaces/external/IERC20Minimal.sol";
+import {FullMath} from "./libraries/FullMath.sol";
+import {StateLibrary} from "./libraries/StateLibrary.sol";
 
 /// @title SpotMarginHook
 /// @notice A Uniswap v4 hook that enables spot margin trading with 0% interest.
@@ -23,8 +25,14 @@ contract SpotMarginHook is IHooks {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using BalanceDeltaLibrary for BalanceDelta;
+    using StateLibrary for IPoolManager;
 
     IPoolManager public immutable manager;
+
+    uint256 public constant MAX_BPS = 10000;
+    uint256 public constant LTV_BPS = 7500; // 75% LTV
+    uint256 public constant LIQUIDATION_THRESHOLD_BPS = 8500; // 85%
+    uint256 public constant LIQUIDATION_BONUS_BPS = 500; // 5% bonus to liquidators
 
     struct Position {
         uint256 collateralAmount;
@@ -150,21 +158,27 @@ contract SpotMarginHook is IHooks {
                 // Settle the debt the hook took on in beforeSwap
                 _settle(inputCurrency, borrowAmount);
 
-                // The output amount from the swap (positive value means hook is owed)
+                // The output amount from the swap (positive value from pool means Pool owes caller, i.e., output)
                 int128 totalOutputAmount = params.zeroForOne ? delta.amount1() : delta.amount0();
 
                 if (totalOutputAmount > 0) {
+                    uint256 absOutputAmount = uint256(int256(totalOutputAmount));
+                    // Check LTV
+                    uint256 collateralValue = getCollateralValue(key, absOutputAmount, outputCurrency, inputCurrency);
+                    require(borrowAmount * MAX_BPS <= collateralValue * LTV_BPS, "Exceeds LTV");
+
                     // We take all output tokens as collateral
-                    manager.take(outputCurrency, address(this), uint128(totalOutputAmount));
+                    manager.take(outputCurrency, address(this), uint128(absOutputAmount));
 
                     positions[user][key.toId()] = Position({
-                        collateralAmount: uint128(totalOutputAmount),
+                        collateralAmount: absOutputAmount,
                         debtAmount: borrowAmount,
                         collateralCurrency: outputCurrency,
                         debtCurrency: inputCurrency
                     });
 
-                    // Return the amount we took to offset the swapDelta
+                    // Return the amount we took to offset the swapDelta.
+                    // Returning a positive value here means the hook takes that amount from the pool's debt to the caller.
                     return (IHooks.afterSwap.selector, totalOutputAmount);
                 }
             }
@@ -217,6 +231,63 @@ contract SpotMarginHook is IHooks {
 
         // Hook returns collateral
         collateralCurrency.transfer(msg.sender, collateral);
+    }
+
+    /// @notice Liquidates an underwater position.
+    function liquidate(address user, PoolKey calldata key) external payable {
+        PoolId poolId = key.toId();
+        Position storage pos = positions[user][poolId];
+        require(pos.collateralAmount > 0, "No active position");
+
+        uint256 healthFactor = getHealthFactor(user, key);
+        require(healthFactor < 1 ether, "Position is healthy");
+
+        uint256 debt = pos.debtAmount;
+        uint256 collateral = pos.collateralAmount;
+        Currency debtCurrency = pos.debtCurrency;
+        Currency collateralCurrency = pos.collateralCurrency;
+
+        delete positions[user][poolId];
+
+        // Liquidator repays debt
+        if (debtCurrency.isAddressZero()) {
+            require(msg.value >= debt, "Not enough ETH to pay debt");
+            if (msg.value > debt) {
+                payable(msg.sender).transfer(msg.value - debt);
+            }
+        } else {
+            IERC20Minimal(Currency.unwrap(debtCurrency)).transferFrom(msg.sender, address(this), debt);
+        }
+
+        // Liquidator gets collateral + bonus (up to total collateral)
+        // In this simple version, liquidator gets everything if it's underwater.
+        collateralCurrency.transfer(msg.sender, collateral);
+    }
+
+    function getHealthFactor(address user, PoolKey calldata key) public view returns (uint256) {
+        Position storage pos = positions[user][key.toId()];
+        if (pos.debtAmount == 0) return type(uint256).max;
+
+        uint256 collateralValue = getCollateralValue(key, pos.collateralAmount, pos.collateralCurrency, pos.debtCurrency);
+
+        // HF = (CollateralValue * LiquidationThreshold * 1e18) / (Debt * MAX_BPS)
+        return FullMath.mulDiv(collateralValue, LIQUIDATION_THRESHOLD_BPS * 1e18, pos.debtAmount * MAX_BPS);
+    }
+
+    function getCollateralValue(PoolKey calldata key, uint256 amount, Currency collateralCurrency, Currency /* debtCurrency */) public view returns (uint256) {
+        (uint160 sqrtPriceX96, , , ) = manager.getSlot0(key.toId());
+
+        if (collateralCurrency == key.currency1) {
+            // Collateral is token1, Debt is token0
+            // Value in token0 = amount * (price1/price0) = amount * (sqrtPrice/2^96)^2
+            uint256 temp = FullMath.mulDiv(amount, uint256(sqrtPriceX96), 1 << 96);
+            return FullMath.mulDiv(temp, uint256(sqrtPriceX96), 1 << 96);
+        } else {
+            // Collateral is token0, Debt is token1
+            // Value in token1 = amount / (price1/price0) = amount * (2^96/sqrtPrice)^2
+            uint256 temp = FullMath.mulDiv(amount, 1 << 96, uint256(sqrtPriceX96));
+            return FullMath.mulDiv(temp, 1 << 96, uint256(sqrtPriceX96));
+        }
     }
 
     receive() external payable {}
