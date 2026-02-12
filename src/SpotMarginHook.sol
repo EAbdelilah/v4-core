@@ -14,18 +14,26 @@ import {SafeCast} from "./libraries/SafeCast.sol";
 import {IERC20Minimal} from "./interfaces/external/IERC20Minimal.sol";
 import {FullMath} from "./libraries/FullMath.sol";
 import {StateLibrary} from "./libraries/StateLibrary.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+interface IOracle {
+    /// @notice Returns the sqrt price of token1 in terms of token0: sqrt(token1/token0) * 2^96
+    function getSqrtPriceX96(PoolKey calldata key) external view returns (uint160);
+}
 
 /// @title SpotMarginHook
 /// @notice A Uniswap v4 hook that enables spot margin trading with 0% interest.
-/// @dev This hook is a proof of concept. In a production environment, a liquidation mechanism
-/// should be implemented to protect lenders from collateral value drops.
-contract SpotMarginHook is IHooks {
+contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     using SafeCast for uint256;
     using SafeCast for int256;
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using BalanceDeltaLibrary for BalanceDelta;
     using StateLibrary for IPoolManager;
+    using SafeERC20 for IERC20;
 
     IPoolManager public immutable manager;
 
@@ -33,6 +41,12 @@ contract SpotMarginHook is IHooks {
     uint256 public constant LTV_BPS = 7500; // 75% LTV
     uint256 public constant LIQUIDATION_THRESHOLD_BPS = 8500; // 85%
     uint256 public constant LIQUIDATION_BONUS_BPS = 500; // 5% bonus to liquidators
+
+    event PositionOpened(address indexed user, PoolId indexed poolId, uint256 collateralAmount, uint256 debtAmount, Currency collateralCurrency, Currency debtCurrency);
+    event PositionClosed(address indexed user, PoolId indexed poolId, uint256 collateralReturned, uint256 debtRepaid);
+    event Liquidated(address indexed user, address indexed liquidator, PoolId indexed poolId, uint256 collateralTaken, uint256 debtRepaid);
+    event Deposit(address indexed lender, Currency indexed currency, uint256 amount);
+    event Withdraw(address indexed lender, Currency indexed currency, uint256 amount);
 
     struct Position {
         uint256 collateralAmount;
@@ -44,9 +58,19 @@ contract SpotMarginHook is IHooks {
     // user => poolId => Position
     mapping(address => mapping(PoolId => Position)) public positions;
 
-    constructor(IPoolManager _manager) {
+    // lender => currency => balance
+    mapping(address => mapping(Currency => uint256)) public lenderBalances;
+
+    IOracle public oracle;
+
+    constructor(IPoolManager _manager, address initialOwner) Ownable(initialOwner) {
         manager = _manager;
     }
+
+    function setOracle(address _oracle) external onlyOwner {
+        oracle = IOracle(_oracle);
+    }
+
 
     modifier onlyManager() {
         require(msg.sender == address(manager), "Only manager");
@@ -162,6 +186,7 @@ contract SpotMarginHook is IHooks {
                 int128 totalOutputAmount = params.zeroForOne ? delta.amount1() : delta.amount0();
 
                 if (totalOutputAmount > 0) {
+                    require(address(oracle) != address(0), "Oracle not set");
                     uint256 absOutputAmount = uint256(int256(totalOutputAmount));
                     // Check LTV
                     uint256 collateralValue = getCollateralValue(key, absOutputAmount, outputCurrency, inputCurrency);
@@ -176,6 +201,8 @@ contract SpotMarginHook is IHooks {
                         collateralCurrency: outputCurrency,
                         debtCurrency: inputCurrency
                     });
+
+                    emit PositionOpened(user, key.toId(), absOutputAmount, borrowAmount, outputCurrency, inputCurrency);
 
                     // Return the amount we took to offset the swapDelta.
                     // Returning a positive value here means the hook takes that amount from the pool's debt to the caller.
@@ -201,13 +228,23 @@ contract SpotMarginHook is IHooks {
         if (currency.isAddressZero()) {
             require(msg.value == amount, "Incorrect ETH amount");
         } else {
-            IERC20Minimal(Currency.unwrap(currency)).transferFrom(msg.sender, address(this), amount);
+            IERC20(Currency.unwrap(currency)).safeTransferFrom(msg.sender, address(this), amount);
         }
+        lenderBalances[msg.sender][currency] += amount;
+        emit Deposit(msg.sender, currency, amount);
+    }
+
+    /// @notice Lenders can withdraw funds from the hook.
+    function withdraw(Currency currency, uint256 amount) external {
+        require(lenderBalances[msg.sender][currency] >= amount, "Insufficient balance");
+        lenderBalances[msg.sender][currency] -= amount;
+        currency.transfer(msg.sender, amount);
+        emit Withdraw(msg.sender, currency, amount);
     }
 
     /// @notice Closes a margin position by repaying debt and reclaiming collateral.
     /// @dev 0% interest rate means the debt is the same as when it was opened.
-    function closePosition(PoolKey calldata key) external payable {
+    function closePosition(PoolKey calldata key) external payable nonReentrant {
         PoolId poolId = key.toId();
         Position storage pos = positions[msg.sender][poolId];
         require(pos.collateralAmount > 0, "No active position");
@@ -223,18 +260,20 @@ contract SpotMarginHook is IHooks {
         if (debtCurrency.isAddressZero()) {
             require(msg.value >= debt, "Not enough ETH to pay debt");
             if (msg.value > debt) {
-                payable(msg.sender).transfer(msg.value - debt);
+                (bool success, ) = payable(msg.sender).call{value: msg.value - debt}("");
+                require(success, "Refund failed");
             }
         } else {
-            IERC20Minimal(Currency.unwrap(debtCurrency)).transferFrom(msg.sender, address(this), debt);
+            IERC20(Currency.unwrap(debtCurrency)).safeTransferFrom(msg.sender, address(this), debt);
         }
 
         // Hook returns collateral
         collateralCurrency.transfer(msg.sender, collateral);
+        emit PositionClosed(msg.sender, poolId, collateral, debt);
     }
 
     /// @notice Liquidates an underwater position.
-    function liquidate(address user, PoolKey calldata key) external payable {
+    function liquidate(address user, PoolKey calldata key) external payable nonReentrant {
         PoolId poolId = key.toId();
         Position storage pos = positions[user][poolId];
         require(pos.collateralAmount > 0, "No active position");
@@ -253,15 +292,28 @@ contract SpotMarginHook is IHooks {
         if (debtCurrency.isAddressZero()) {
             require(msg.value >= debt, "Not enough ETH to pay debt");
             if (msg.value > debt) {
-                payable(msg.sender).transfer(msg.value - debt);
+                (bool success, ) = payable(msg.sender).call{value: msg.value - debt}("");
+                require(success, "Refund failed");
             }
         } else {
-            IERC20Minimal(Currency.unwrap(debtCurrency)).transferFrom(msg.sender, address(this), debt);
+            IERC20(Currency.unwrap(debtCurrency)).safeTransferFrom(msg.sender, address(this), debt);
         }
 
         // Liquidator gets collateral + bonus (up to total collateral)
-        // In this simple version, liquidator gets everything if it's underwater.
-        collateralCurrency.transfer(msg.sender, collateral);
+        // Calculating liquidator reward: debtValueInCollateral * (1 + bonus)
+        uint256 debtInCollateral = getCollateralValue(key, debt, debtCurrency, collateralCurrency);
+        uint256 rewardAmount = FullMath.mulDiv(debtInCollateral, MAX_BPS + LIQUIDATION_BONUS_BPS, MAX_BPS);
+
+        if (rewardAmount > collateral) {
+            rewardAmount = collateral;
+        }
+
+        // Liquidator gets reward
+        collateralCurrency.transfer(msg.sender, rewardAmount);
+
+        // Remaining collateral (if any) stays in the hook as profit/buffer
+
+        emit Liquidated(user, msg.sender, poolId, rewardAmount, debt);
     }
 
     function getHealthFactor(address user, PoolKey calldata key) public view returns (uint256) {
@@ -275,18 +327,19 @@ contract SpotMarginHook is IHooks {
     }
 
     function getCollateralValue(PoolKey calldata key, uint256 amount, Currency collateralCurrency, Currency /* debtCurrency */) public view returns (uint256) {
-        (uint160 sqrtPriceX96, , , ) = manager.getSlot0(key.toId());
+        require(address(oracle) != address(0), "Oracle not set");
+        uint160 sqrtPriceX96 = oracle.getSqrtPriceX96(key);
 
         if (collateralCurrency == key.currency1) {
             // Collateral is token1, Debt is token0
-            // Value in token0 = amount * (price1/price0) = amount * (sqrtPrice/2^96)^2
-            uint256 temp = FullMath.mulDiv(amount, uint256(sqrtPriceX96), 1 << 96);
-            return FullMath.mulDiv(temp, uint256(sqrtPriceX96), 1 << 96);
-        } else {
-            // Collateral is token0, Debt is token1
-            // Value in token1 = amount / (price1/price0) = amount * (2^96/sqrtPrice)^2
+            // Value in token0 = amount / (token1/token0) = amount * (2^96/sqrtPrice)^2
             uint256 temp = FullMath.mulDiv(amount, 1 << 96, uint256(sqrtPriceX96));
             return FullMath.mulDiv(temp, 1 << 96, uint256(sqrtPriceX96));
+        } else {
+            // Collateral is token0, Debt is token1
+            // Value in token1 = amount * (token1/token0) = amount * (sqrtPrice/2^96)^2
+            uint256 temp = FullMath.mulDiv(amount, uint256(sqrtPriceX96), 1 << 96);
+            return FullMath.mulDiv(temp, uint256(sqrtPriceX96), 1 << 96);
         }
     }
 

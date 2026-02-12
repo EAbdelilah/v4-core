@@ -12,8 +12,9 @@ import {Hooks} from "../src/libraries/Hooks.sol";
 import {IHooks} from "../src/interfaces/IHooks.sol";
 import {ModifyLiquidityParams, SwapParams} from "../src/types/PoolOperation.sol";
 import {PoolSwapTest} from "../src/test/PoolSwapTest.sol";
-import {SpotMarginHook} from "../src/SpotMarginHook.sol";
+import {SpotMarginHook, IOracle} from "../src/SpotMarginHook.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {MockOracle} from "../src/test/MockOracle.sol";
 import {BalanceDelta} from "../src/types/BalanceDelta.sol";
 import {Constants} from "./utils/Constants.sol";
 
@@ -22,6 +23,7 @@ contract SpotMarginHookTest is Test, Deployers {
     using CurrencyLibrary for Currency;
 
     SpotMarginHook hook;
+    MockOracle oracle;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -29,9 +31,12 @@ contract SpotMarginHookTest is Test, Deployers {
         // Permissions: beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta
         // 0xCC = 204
         address hookAddress = address(uint160(204));
-        SpotMarginHook hookImpl = new SpotMarginHook(manager);
+        SpotMarginHook hookImpl = new SpotMarginHook(manager, address(this));
         vm.etch(hookAddress, address(hookImpl).code);
         hook = SpotMarginHook(payable(hookAddress));
+
+        // Initialize storage at etched address
+        vm.store(hookAddress, bytes32(uint256(0)), bytes32(uint256(uint160(address(this)))));
 
         (currency0, currency1) = deployMintAndApprove2Currencies();
 
@@ -41,9 +46,19 @@ contract SpotMarginHookTest is Test, Deployers {
         LIQUIDITY_PARAMS = ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 0, salt: 0});
         seedMoreLiquidity(key, 100e18, 100e18);
 
-        // Fund the hook with 100 of each currency
-        MockERC20(Currency.unwrap(currency0)).mint(address(hook), 100e18);
-        MockERC20(Currency.unwrap(currency1)).mint(address(hook), 100e18);
+        // Deploy and set oracle
+        oracle = new MockOracle();
+        oracle.setPrice(SQRT_PRICE_1_1);
+        hook.setOracle(address(oracle));
+
+        // Fund the hook via deposit
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), 100e18);
+        MockERC20(Currency.unwrap(currency0)).approve(address(hook), 100e18);
+        hook.deposit(currency0, 100e18);
+
+        MockERC20(Currency.unwrap(currency1)).mint(address(this), 100e18);
+        MockERC20(Currency.unwrap(currency1)).approve(address(hook), 100e18);
+        hook.deposit(currency1, 100e18);
     }
 
     function test_marginSwap_long_0_interest() public {
@@ -223,22 +238,33 @@ contract SpotMarginHookTest is Test, Deployers {
         // Collateral is token1. Debt is token0.
         // If price of token1 drops relative to token0, HF decreases.
         // Token1 value in token0 = amount1 * price1/price0.
-        // Swap token0 for token1 (zeroForOne=true) to push price down (token1 becomes cheaper relative to token0).
-        MockERC20(Currency.unwrap(currency0)).mint(address(this), 90e18);
-        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), 90e18);
+        // Swap token1 for token0 (zeroForOne=false) to push price up (token1 becomes cheaper relative to token0).
+        // Wait, if P = token1/token0 increases, it means more token1 per token0, so token1 is cheaper.
+        MockERC20(Currency.unwrap(currency1)).mint(address(this), 90e18);
+        MockERC20(Currency.unwrap(currency1)).approve(address(swapRouter), 90e18);
         swapRouter.swap(key,
             SwapParams({
-                zeroForOne: true,
+                zeroForOne: false,
                 amountSpecified: -90e18,
-                sqrtPriceLimitX96: MIN_PRICE_LIMIT
+                sqrtPriceLimitX96: MAX_PRICE_LIMIT
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
         );
 
+        // Pushing pool price down shouldn't affect HF if oracle stays same
         hf = hook.getHealthFactor(address(this), key);
-        // console.log("HF after drop:", hf);
-        assertTrue(hf < 1 ether, "Should be liquidatable after price drop");
+        assertTrue(hf >= 1 ether, "Should stay healthy if oracle is stable");
+
+        // Move ORACLE price to make it liquidatable
+        oracle.setPrice(uint160(uint256(SQRT_PRICE_1_1) * 2)); // Token1 is now 4x cheaper relative to token0?
+        // Wait, if P = token1/token0, P increases means token1 is more plentiful/cheaper.
+        // P = (sqrtPrice/2^96)^2.
+        // If sqrtPrice doubles, P quadruples.
+        // Token1 value in token0 = 1/P. So it drops to 1/4.
+
+        hf = hook.getHealthFactor(address(this), key);
+        assertTrue(hf < 1 ether, "Should be liquidatable after ORACLE price drop");
 
         // Liquidate
         address liquidator = makeAddr("liquidator");
@@ -278,5 +304,48 @@ contract SpotMarginHookTest is Test, Deployers {
         // Verify no position
         (uint256 collateral,,,) = hook.positions(address(this), key.toId());
         assertEq(collateral, 0, "No position should be opened for exact output");
+    }
+
+    function test_lender_withdrawal() public {
+        address lender = makeAddr("lender");
+        uint256 amount = 10e18;
+        MockERC20(Currency.unwrap(currency0)).mint(lender, amount);
+
+        vm.startPrank(lender);
+        MockERC20(Currency.unwrap(currency0)).approve(address(hook), amount);
+        hook.deposit(currency0, amount);
+
+        assertEq(hook.lenderBalances(lender, currency0), amount);
+
+        hook.withdraw(currency0, amount);
+        assertEq(hook.lenderBalances(lender, currency0), 0);
+        assertEq(MockERC20(Currency.unwrap(currency0)).balanceOf(lender), amount);
+        vm.stopPrank();
+    }
+
+    function test_events() public {
+        uint256 collateralProvided = 10e18;
+        uint256 borrowAmount = 2e18;
+
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), collateralProvided);
+        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), collateralProvided);
+
+        bytes memory hookData = abi.encode(address(this), borrowAmount);
+
+        vm.expectEmit(true, true, false, false);
+        emit SpotMarginHook.PositionOpened(address(this), key.toId(), 0, borrowAmount, currency1, currency0);
+        // Note: we use 0 for collateralAmount because we don't know the exact output yet,
+        // but forge's expectEmit with 'true' for that field will match any value if we handle it correctly.
+        // Actually, let's just check the ones we know.
+
+        swapRouter.swap(key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -int256(collateralProvided),
+                sqrtPriceLimitX96: MIN_PRICE_LIMIT
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            hookData
+        );
     }
 }
