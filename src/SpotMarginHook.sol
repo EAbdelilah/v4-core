@@ -61,6 +61,12 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     // lender => currency => balance
     mapping(address => mapping(Currency => uint256)) public lenderBalances;
 
+    // currency => total amount currently lent out
+    mapping(Currency => uint256) public totalLent;
+
+    // currency => accumulated collateral from liquidations
+    mapping(Currency => uint256) public insuranceFund;
+
     IOracle public oracle;
 
     constructor(IPoolManager _manager, address initialOwner) Ownable(initialOwner) {
@@ -202,6 +208,8 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
                         debtCurrency: inputCurrency
                     });
 
+                    totalLent[inputCurrency] += borrowAmount;
+
                     emit PositionOpened(user, key.toId(), absOutputAmount, borrowAmount, outputCurrency, inputCurrency);
 
                     // Return the amount we took to offset the swapDelta.
@@ -255,6 +263,7 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
         Currency collateralCurrency = pos.collateralCurrency;
 
         delete positions[msg.sender][poolId];
+        totalLent[debtCurrency] -= debt;
 
         // User pays debt (0% interest)
         if (debtCurrency.isAddressZero()) {
@@ -273,6 +282,8 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     }
 
     /// @notice Liquidates an underwater position.
+    /// @dev Liquidator no longer pays the debt. Collateral is used to cover the debt.
+    /// The debt is returned to the pool (lending pool) via the collateral being kept as insurance.
     function liquidate(address user, PoolKey calldata key) external payable nonReentrant {
         PoolId poolId = key.toId();
         Position storage pos = positions[user][poolId];
@@ -287,33 +298,18 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
         Currency collateralCurrency = pos.collateralCurrency;
 
         delete positions[user][poolId];
+        totalLent[debtCurrency] -= debt;
 
-        // Liquidator repays debt
-        if (debtCurrency.isAddressZero()) {
-            require(msg.value >= debt, "Not enough ETH to pay debt");
-            if (msg.value > debt) {
-                (bool success, ) = payable(msg.sender).call{value: msg.value - debt}("");
-                require(success, "Refund failed");
-            }
-        } else {
-            IERC20(Currency.unwrap(debtCurrency)).safeTransferFrom(msg.sender, address(this), debt);
-        }
+        // Bounty for the liquidator (incentive for triggering)
+        uint256 bounty = FullMath.mulDiv(collateral, LIQUIDATION_BONUS_BPS, MAX_BPS);
 
-        // Liquidator gets collateral + bonus (up to total collateral)
-        // Calculating liquidator reward: debtValueInCollateral * (1 + bonus)
-        uint256 debtInCollateral = getCollateralValue(key, debt, debtCurrency, collateralCurrency);
-        uint256 rewardAmount = FullMath.mulDiv(debtInCollateral, MAX_BPS + LIQUIDATION_BONUS_BPS, MAX_BPS);
+        // Liquidator gets bounty
+        collateralCurrency.transfer(msg.sender, bounty);
 
-        if (rewardAmount > collateral) {
-            rewardAmount = collateral;
-        }
+        // Remaining collateral stays in the hook as insurance/recovery for the debt
+        insuranceFund[collateralCurrency] += (collateral - bounty);
 
-        // Liquidator gets reward
-        collateralCurrency.transfer(msg.sender, rewardAmount);
-
-        // Remaining collateral (if any) stays in the hook as profit/buffer
-
-        emit Liquidated(user, msg.sender, poolId, rewardAmount, debt);
+        emit Liquidated(user, msg.sender, poolId, bounty, debt);
     }
 
     function getHealthFactor(address user, PoolKey calldata key) public view returns (uint256) {

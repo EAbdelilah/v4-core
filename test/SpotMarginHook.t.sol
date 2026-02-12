@@ -85,10 +85,10 @@ contract SpotMarginHookTest is Test, Deployers {
         swapRouter.swap(key, params, settings, hookData);
 
         // Verify position
-        (uint256 collateral, uint256 debt, Currency collateralCurr, Currency debtCurr) = hook.positions(address(this), key.toId());
+        (uint256 collateralBefore, uint256 debtBefore, Currency collateralCurr, Currency debtCurr) = hook.positions(address(this), key.toId());
 
-        assertEq(debt, borrowAmount, "Debt should match borrow amount");
-        assertTrue(collateral > 0, "Collateral should be recorded");
+        assertEq(debtBefore, borrowAmount, "Debt should match borrow amount");
+        assertTrue(collateralBefore > 0, "Collateral should be recorded");
         assertEq(Currency.unwrap(collateralCurr), Currency.unwrap(currency1));
         assertEq(Currency.unwrap(debtCurr), Currency.unwrap(currency0));
 
@@ -97,17 +97,17 @@ contract SpotMarginHookTest is Test, Deployers {
 
         // Close position
         // User pays debt (still 2e18 because 0% interest)
-        MockERC20(Currency.unwrap(currency0)).mint(address(this), debt);
-        MockERC20(Currency.unwrap(currency0)).approve(address(hook), debt);
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), debtBefore);
+        MockERC20(Currency.unwrap(currency0)).approve(address(hook), debtBefore);
 
         uint256 balanceBefore = currency1.balanceOf(address(this));
         hook.closePosition(key);
         uint256 balanceAfter = currency1.balanceOf(address(this));
 
-        assertEq(balanceAfter - balanceBefore, collateral, "User should receive all collateral back");
+        assertEq(balanceAfter - balanceBefore, collateralBefore, "User should receive all collateral back");
 
-        (collateral,,, ) = hook.positions(address(this), key.toId());
-        assertEq(collateral, 0, "Position should be closed");
+        (uint256 collateralAfter,,, ) = hook.positions(address(this), key.toId());
+        assertEq(collateralAfter, 0, "Position should be closed");
     }
 
     function test_marginSwap_short_0_interest() public {
@@ -134,22 +134,22 @@ contract SpotMarginHookTest is Test, Deployers {
         swapRouter.swap(key, params, settings, hookData);
 
         // Verify position
-        (uint256 collateral, uint256 debt, Currency collateralCurr, Currency debtCurr) = hook.positions(address(this), key.toId());
+        (uint256 collateralBefore, uint256 debtBefore, Currency collateralCurr, Currency debtCurr) = hook.positions(address(this), key.toId());
 
-        assertEq(debt, borrowAmount, "Debt should match borrow amount");
-        assertTrue(collateral > 0, "Collateral should be recorded");
+        assertEq(debtBefore, borrowAmount, "Debt should match borrow amount");
+        assertTrue(collateralBefore > 0, "Collateral should be recorded");
         assertEq(Currency.unwrap(collateralCurr), Currency.unwrap(currency0));
         assertEq(Currency.unwrap(debtCurr), Currency.unwrap(currency1));
 
         // Close position
-        MockERC20(Currency.unwrap(currency1)).mint(address(this), debt);
-        MockERC20(Currency.unwrap(currency1)).approve(address(hook), debt);
+        MockERC20(Currency.unwrap(currency1)).mint(address(this), debtBefore);
+        MockERC20(Currency.unwrap(currency1)).approve(address(hook), debtBefore);
 
         uint256 balanceBefore = currency0.balanceOf(address(this));
         hook.closePosition(key);
         uint256 balanceAfter = currency0.balanceOf(address(this));
 
-        assertEq(balanceAfter - balanceBefore, collateral, "User should receive all collateral back");
+        assertEq(balanceAfter - balanceBefore, collateralBefore, "User should receive all collateral back");
     }
 
     function test_revert_positionExists() public {
@@ -228,6 +228,8 @@ contract SpotMarginHookTest is Test, Deployers {
             hookData
         );
 
+        (uint256 collateralBefore, , ,) = hook.positions(address(this), key.toId());
+
         // Check health factor
         uint256 hf = hook.getHealthFactor(address(this), key);
         // console.log("HF initially:", hf);
@@ -268,20 +270,24 @@ contract SpotMarginHookTest is Test, Deployers {
 
         // Liquidate
         address liquidator = makeAddr("liquidator");
-        MockERC20(Currency.unwrap(currency0)).mint(liquidator, borrowAmount);
+
+        uint256 posCollateral = collateralBefore;
+        uint256 expectedBounty = posCollateral * hook.LIQUIDATION_BONUS_BPS() / hook.MAX_BPS();
+        uint256 expectedInsurance = posCollateral - expectedBounty;
 
         vm.startPrank(liquidator);
-        MockERC20(Currency.unwrap(currency0)).approve(address(hook), borrowAmount);
-
         uint256 balanceBefore = currency1.balanceOf(liquidator);
         hook.liquidate(address(this), key);
         uint256 balanceAfter = currency1.balanceOf(liquidator);
 
-        assertTrue(balanceAfter > balanceBefore, "Liquidator should get collateral");
+        assertEq(balanceAfter - balanceBefore, expectedBounty, "Liquidator should get bounty");
         vm.stopPrank();
 
-        (uint256 collateral,,,) = hook.positions(address(this), key.toId());
-        assertEq(collateral, 0, "Position should be deleted after liquidation");
+        assertEq(hook.insuranceFund(currency1), expectedInsurance, "Insurance fund should get remainder");
+        assertEq(hook.totalLent(currency0), 0, "Total lent should be 0 after liquidation");
+
+        (uint256 collateralAfter,,,) = hook.positions(address(this), key.toId());
+        assertEq(collateralAfter, 0, "Position should be deleted after liquidation");
     }
 
     function test_exactOutput_noMargin() public {
