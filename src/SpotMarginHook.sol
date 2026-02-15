@@ -78,6 +78,14 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     }
 
 
+    /// @notice Allows owner to claim accumulated insurance funds.
+    function claimInsuranceFund(Currency currency, uint256 amount) external onlyOwner {
+        require(insuranceFund[currency] >= amount, "Insufficient insurance funds");
+        insuranceFund[currency] -= amount;
+        currency.transfer(msg.sender, amount);
+    }
+
+
     modifier onlyManager() {
         require(msg.sender == address(manager), "Only manager");
         _;
@@ -152,7 +160,6 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     /// @notice Before a swap, if it's a margin trade, the hook provides the borrowed funds.
     function beforeSwap(address, PoolKey calldata, SwapParams calldata params, bytes calldata hookData)
         external
-        view
         override
         onlyManager
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -163,7 +170,8 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
             if (borrowAmount > 0) {
                 // Return a delta to indicate the hook is providing some of the input tokens.
                 // A negative specified delta increases the amount swapped in the pool.
-                return (IHooks.beforeSwap.selector, toBeforeSwapDelta(int128(-int256(borrowAmount)), 0), 0);
+                int256 delta = -int256(borrowAmount);
+                return (IHooks.beforeSwap.selector, toBeforeSwapDelta(delta.toInt128(), 0), 0);
             }
         }
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
