@@ -37,5 +37,6 @@ The address must start with `0xCC...` (in the first byte).
 ## 4. Production Security Considerations
 - **Oracle:** The `IOracle` used must be robust against manipulation. Using a Uniswap v4 TWAP oracle (via another hook or a separate contract) is recommended.
 - **LTV/Thresholds:** Currently, LTV and Liquidation thresholds are `constant` in this POC. For a production-ready contract, consider making these state variables adjustable by the `Owner` or a DAO.
-- **Insurance Fund:** Monitor the `insuranceFund` to ensure it can cover potential bad debt during extreme volatility.
+- **Fees:** The hook charges a default protocol fee of 10 bps (0.1%). This can be adjusted by the owner via `setProtocolFee`.
+- **Insurance Fund:** Monitor the `insuranceFund` and use `refillLendingPool` to swap recovered collateral back into debt assets to maintain protocol solvency.
 - **Contract Ownership:** Transfer ownership to a Multi-sig or a Governance contract.

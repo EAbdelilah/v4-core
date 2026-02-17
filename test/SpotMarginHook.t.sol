@@ -184,6 +184,83 @@ contract SpotMarginHookTest is Test, Deployers {
         );
     }
 
+    function test_monetization() public {
+        uint256 borrowAmount = 0.2 ether;
+        bytes memory hookData = abi.encode(address(this), borrowAmount);
+
+        // Ensure protocol fee is set (since etch doesn't preserve storage defaults)
+        hook.setProtocolFee(10);
+
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), 1 ether);
+        MockERC20(Currency.unwrap(currency0)).approve(address(hook), 1 ether);
+        hook.deposit(currency0, 1 ether);
+
+        // Perform margin swap
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -0.1 ether,
+                sqrtPriceLimitX96: MIN_PRICE_LIMIT
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            hookData
+        );
+
+        // Default fee is 0.1% (10 bps)
+        // Output for 0.3 input (0.1 user + 0.2 borrow) should be approx 0.3 output tokens
+        uint256 collectedFee = hook.protocolFees(currency1);
+        assertTrue(collectedFee > 0, "Fee should be collected");
+
+        // Collect fees
+        uint256 balBefore = currency1.balanceOf(address(this));
+        hook.collectProtocolFees(currency1, collectedFee);
+        uint256 balAfter = currency1.balanceOf(address(this));
+        assertEq(balAfter - balBefore, collectedFee);
+        assertEq(hook.protocolFees(currency1), 0);
+    }
+
+    function test_refillLendingPool() public {
+        // 1. Manually add some funds to insurance fund (simulating liquidation surplus)
+        uint256 insuranceAmount = 1 ether;
+        MockERC20(Currency.unwrap(currency1)).mint(address(hook), insuranceAmount);
+        // We need to use vm.store because insuranceFund is a mapping and we want to simulate it being populated
+        // Alternatively, we can just run a liquidation, but this is faster for unit testing the refill logic.
+
+        // Let's just do a liquidation to be realistic.
+        uint256 collateralProvided = 1e18;
+        uint256 borrowAmount = 2e18;
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), collateralProvided);
+        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), collateralProvided);
+        swapRouter.swap(key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -int256(collateralProvided),
+                sqrtPriceLimitX96: MIN_PRICE_LIMIT
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(address(this), borrowAmount)
+        );
+
+        // Move price to make it liquidatable
+        oracle.setPrice(uint160(uint256(SQRT_PRICE_1_1) * 2));
+        hook.liquidate(address(this), key);
+
+        uint256 insuranceBal = hook.insuranceFund(currency1);
+        assertTrue(insuranceBal > 0, "Insurance fund should have collateral");
+
+        // Now refill the lending pool for currency0 (the debt asset)
+        // We swap currency1 (collateral) for currency0 (debt)
+        uint256 amountToSwap = insuranceBal;
+        uint256 bal0Before = currency0.balanceOf(address(hook));
+
+        hook.refillLendingPool(key, false, amountToSwap);
+
+        uint256 bal0After = currency0.balanceOf(address(hook));
+        assertTrue(bal0After > bal0Before, "Lending pool should be refilled with debt asset");
+        assertEq(hook.insuranceFund(currency1), 0);
+    }
+
     function test_revert_exceedsLTV() public {
         uint256 collateralProvided = 1e18;
         // At 1:1 price, if we borrow 10e18 against 1e18 input, total input is 11e18.

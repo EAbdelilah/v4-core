@@ -42,6 +42,8 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     uint256 public constant LIQUIDATION_THRESHOLD_BPS = 8500; // 85%
     uint256 public constant LIQUIDATION_BONUS_BPS = 500; // 5% bonus to liquidators
 
+    uint256 public protocolFeeBps = 10; // 0.1% default fee
+
     event PositionOpened(address indexed user, PoolId indexed poolId, uint256 collateralAmount, uint256 debtAmount, Currency collateralCurrency, Currency debtCurrency);
     event PositionClosed(address indexed user, PoolId indexed poolId, uint256 collateralReturned, uint256 debtRepaid);
     event Liquidated(address indexed user, address indexed liquidator, PoolId indexed poolId, uint256 collateralTaken, uint256 debtRepaid);
@@ -67,6 +69,9 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     // currency => accumulated collateral from liquidations
     mapping(Currency => uint256) public insuranceFund;
 
+    // currency => collected protocol fees
+    mapping(Currency => uint256) public protocolFees;
+
     IOracle public oracle;
 
     constructor(IPoolManager _manager, address initialOwner) Ownable(initialOwner) {
@@ -77,12 +82,60 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
         oracle = IOracle(_oracle);
     }
 
+    function setProtocolFee(uint256 _feeBps) external onlyOwner {
+        require(_feeBps <= 1000, "Fee too high"); // Max 10%
+        protocolFeeBps = _feeBps;
+    }
 
     /// @notice Allows owner to claim accumulated insurance funds.
     function claimInsuranceFund(Currency currency, uint256 amount) external onlyOwner {
         require(insuranceFund[currency] >= amount, "Insufficient insurance funds");
         insuranceFund[currency] -= amount;
         currency.transfer(msg.sender, amount);
+    }
+
+    /// @notice Allows owner to collect accumulated protocol fees.
+    function collectProtocolFees(Currency currency, uint256 amount) external onlyOwner {
+        require(protocolFees[currency] >= amount, "Insufficient protocol fees");
+        protocolFees[currency] -= amount;
+        currency.transfer(msg.sender, amount);
+    }
+
+    /// @notice Allows owner to refill the lending pool by swapping insurance collateral for the debt currency.
+    /// @dev This is used to recover from bad debt using the insurance fund.
+    function refillLendingPool(PoolKey calldata poolKey, bool zeroForOne, uint256 amountIn) external onlyOwner {
+        Currency currencyIn = zeroForOne ? poolKey.currency0 : poolKey.currency1;
+        require(insuranceFund[currencyIn] >= amountIn, "Insufficient insurance fund");
+
+        insuranceFund[currencyIn] -= amountIn;
+
+        // Simple swap via PoolManager
+        manager.unlock(abi.encode(poolKey, zeroForOne, amountIn));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (PoolKey memory poolKey, bool zeroForOne, uint256 amountIn) = abi.decode(data, (PoolKey, bool, uint256));
+
+        BalanceDelta delta = manager.swap(poolKey, SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: zeroForOne ? (uint160(4295128739) + 1) : (uint160(1461446703485210103287273052203988822378723970341) - 1)
+        }), "");
+
+        // Settle the swap
+        Currency currencyIn = zeroForOne ? poolKey.currency0 : poolKey.currency1;
+        Currency currencyOut = zeroForOne ? poolKey.currency1 : poolKey.currency0;
+
+        _settle(currencyIn, amountIn);
+
+        // The output of the swap goes to the hook's balance (lending pool)
+        int128 amountOut = zeroForOne ? delta.amount1() : delta.amount0();
+        if (amountOut > 0) {
+            manager.take(currencyOut, address(this), uint256(int256(amountOut)));
+        }
+
+        return "";
     }
 
 
@@ -193,6 +246,10 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
                 Currency inputCurrency = params.zeroForOne ? key.currency0 : key.currency1;
                 Currency outputCurrency = params.zeroForOne ? key.currency1 : key.currency0;
 
+                // Check if enough liquidity is available to lend
+                uint256 available = inputCurrency.balanceOf(address(this)) - totalLent[inputCurrency];
+                require(borrowAmount <= available, "Insufficient lending liquidity");
+
                 // Settle the debt the hook took on in beforeSwap
                 _settle(inputCurrency, borrowAmount);
 
@@ -209,8 +266,12 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
                     // We take all output tokens as collateral
                     manager.take(outputCurrency, address(this), uint128(absOutputAmount));
 
+                    uint256 fee = FullMath.mulDiv(absOutputAmount, protocolFeeBps, MAX_BPS);
+                    uint256 collateralAfterFee = absOutputAmount - fee;
+                    protocolFees[outputCurrency] += fee;
+
                     positions[user][key.toId()] = Position({
-                        collateralAmount: absOutputAmount,
+                        collateralAmount: collateralAfterFee,
                         debtAmount: borrowAmount,
                         collateralCurrency: outputCurrency,
                         debtCurrency: inputCurrency
