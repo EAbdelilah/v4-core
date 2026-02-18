@@ -189,7 +189,7 @@ contract SpotMarginHookTest is Test, Deployers {
         bytes memory hookData = abi.encode(address(this), borrowAmount);
 
         // Ensure protocol fee is set (since etch doesn't preserve storage defaults)
-        hook.setProtocolFee(10);
+        hook.setProtocolFee(50);
 
         MockERC20(Currency.unwrap(currency0)).mint(address(this), 1 ether);
         MockERC20(Currency.unwrap(currency0)).approve(address(hook), 1 ether);

@@ -42,7 +42,7 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
     uint256 public constant LIQUIDATION_THRESHOLD_BPS = 8500; // 85%
     uint256 public constant LIQUIDATION_BONUS_BPS = 500; // 5% bonus to liquidators
 
-    uint256 public protocolFeeBps = 10; // 0.1% default fee
+    uint256 public protocolFeeBps = 50; // 0.5% default fee
 
     event PositionOpened(address indexed user, PoolId indexed poolId, uint256 collateralAmount, uint256 debtAmount, Currency collateralCurrency, Currency debtCurrency);
     event PositionClosed(address indexed user, PoolId indexed poolId, uint256 collateralReturned, uint256 debtRepaid);
@@ -127,12 +127,15 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
         Currency currencyIn = zeroForOne ? poolKey.currency0 : poolKey.currency1;
         Currency currencyOut = zeroForOne ? poolKey.currency1 : poolKey.currency0;
 
-        _settle(currencyIn, amountIn);
+        int128 amountInDelta = zeroForOne ? delta.amount0() : delta.amount1();
+        if (amountInDelta < 0) {
+            _settle(currencyIn, uint256(int256(-amountInDelta)));
+        }
 
         // The output of the swap goes to the hook's balance (lending pool)
-        int128 amountOut = zeroForOne ? delta.amount1() : delta.amount0();
-        if (amountOut > 0) {
-            manager.take(currencyOut, address(this), uint256(int256(amountOut)));
+        int128 amountOutDelta = zeroForOne ? delta.amount1() : delta.amount0();
+        if (amountOutDelta > 0) {
+            manager.take(currencyOut, address(this), uint256(int256(amountOutDelta)));
         }
 
         return "";
@@ -247,18 +250,20 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
                 Currency outputCurrency = params.zeroForOne ? key.currency1 : key.currency0;
 
                 // Check if enough liquidity is available to lend
-                uint256 available = inputCurrency.balanceOf(address(this)) - totalLent[inputCurrency];
+                // Idle liquidity in the contract is what's available.
+                uint256 available = inputCurrency.balanceOf(address(this));
                 require(borrowAmount <= available, "Insufficient lending liquidity");
 
                 // Settle the debt the hook took on in beforeSwap
                 _settle(inputCurrency, borrowAmount);
 
-                // The output amount from the swap (positive value from pool means Pool owes caller, i.e., output)
-                int128 totalOutputAmount = params.zeroForOne ? delta.amount1() : delta.amount0();
+                // The output amount from the swap.
+                // In this implementation, output deltas are positive (pool owes caller).
+                int128 totalOutputDelta = params.zeroForOne ? delta.amount1() : delta.amount0();
 
-                if (totalOutputAmount > 0) {
+                if (totalOutputDelta > 0) {
                     require(address(oracle) != address(0), "Oracle not set");
-                    uint256 absOutputAmount = uint256(int256(totalOutputAmount));
+                    uint256 absOutputAmount = uint256(int256(totalOutputDelta));
                     // Check LTV
                     uint256 collateralValue = getCollateralValue(key, absOutputAmount, outputCurrency, inputCurrency);
                     require(borrowAmount * MAX_BPS <= collateralValue * LTV_BPS, "Exceeds LTV");
@@ -281,9 +286,10 @@ contract SpotMarginHook is IHooks, Ownable, ReentrancyGuard {
 
                     emit PositionOpened(user, key.toId(), absOutputAmount, borrowAmount, outputCurrency, inputCurrency);
 
-                    // Return the amount we took to offset the swapDelta.
-                    // Returning a positive value here means the hook takes that amount from the pool's debt to the caller.
-                    return (IHooks.afterSwap.selector, totalOutputAmount);
+                    // Return the amount we took to offset the swapDelta (making user delta 0).
+                    // Returning a positive value here credits the hook and debits the user.
+                    // Then calling manager.take(absOutputAmount) zeros out the hook's credit and gives it the tokens.
+                    return (IHooks.afterSwap.selector, int128(int256(absOutputAmount)));
                 }
             }
         }
